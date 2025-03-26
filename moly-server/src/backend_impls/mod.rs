@@ -7,9 +7,9 @@ use std::{
 use chrono::Utc;
 use moly_protocol::{
     data::{DownloadedFile, FileID, PendingDownload},
-    open_ai::{ChatRequestData, ChatResponse},
+    open_ai::{ChatRequestData, ChatResponse, ModelsResponse, OpenAIModel},
     protocol::{
-        FileDownloadResponse, LoadModelOptions, LoadModelResponse,
+        FileDownloadResponse, LoadModelOptions, LoadModelResponse
     },
 };
 use tokio::sync::{mpsc::{UnboundedSender, Sender, Receiver}, RwLock};
@@ -62,6 +62,8 @@ pub struct BackendImpl<Model: BackendModel> {
     models_dir: PathBuf,
     /// The currently loaded model.
     model: Option<Model>,
+    /// The currently loaded model id.
+    current_model_id: Option<String>,
     /// A channel for sending model download requests to the downloader thread.
     download_tx: UnboundedSender<(
         store::models::Model,
@@ -133,6 +135,7 @@ impl<Model: BackendModel + Send + 'static> BackendImpl<Model> {
             app_data_dir,
             models_dir: models_dir.as_ref().into(),
             download_tx,
+            current_model_id: None,
             model: None,
             control_tx,
             download_progress: Arc::new(RwLock::new(HashMap::new())),
@@ -261,6 +264,21 @@ impl<Model: BackendModel + Send + 'static> BackendImpl<Model> {
         )
     }
 
+    pub async fn load_model_with_default_opts(&mut self, file_id: String) -> Result<LoadModelResponse, anyhow::Error> {
+        let default_opts = LoadModelOptions {
+            override_server_address: None,
+            prompt_template: None,
+            gpu_layers: moly_protocol::protocol::GPULayers::Max,
+            use_mlock: false,
+            rope_freq_scale: 0.0,
+            rope_freq_base: 0.0,
+            context_overflow_policy: moly_protocol::protocol::ContextOverflowPolicy::StopAtLimit,
+            n_batch: None,
+            n_ctx: None,
+        };
+        self.load_model(file_id, default_opts).await
+    }
+
     pub async fn load_model(&mut self, file_id: String, options: LoadModelOptions) -> Result<LoadModelResponse, anyhow::Error> {
         let download_file =
             store::download_files::DownloadedFile::get_by_id(&self.open_db_conn(), &file_id);
@@ -280,6 +298,7 @@ impl<Model: BackendModel + Send + 'static> BackendImpl<Model> {
                 match result {
                     Ok((model, response)) => {
                         self.model = Some(model);
+                        self.current_model_id = Some(file_id);
                         return Ok(response);
                     }
                     Err(e) => {
@@ -350,6 +369,21 @@ impl<Model: BackendModel + Send + 'static> BackendImpl<Model> {
         }
     }
 
+    pub fn get_models(&self) -> Result<ModelsResponse, anyhow::Error> {
+        let files = store::get_all_download_file(&self.open_db_conn())
+            .map_err(|e| anyhow::anyhow!("get download file error: {e}"))?;
+
+        Ok(ModelsResponse {
+            object: "list".to_string(),
+            data: files.into_iter().map(|file| OpenAIModel {
+                id: file.file.id,
+                object: "model".to_string(),
+                created: file.downloaded_at.timestamp() as u32,
+                owned_by: "moly".to_string(),
+            }).collect(),
+        })
+    }
+
     // WIP. Keeping this for reference.
     // pub fn update_models_dir<M: AsRef<Path>>(&mut self, models_dir: M) {
     //     self.models_dir = models_dir.as_ref().to_path_buf();
@@ -362,6 +396,10 @@ impl<Model: BackendModel + Send + 'static> BackendImpl<Model> {
         } else {
             Err(anyhow::anyhow!("Model not loaded"))
         }
+    }
+
+    pub fn currently_loaded_model_id(&self) -> Option<&String> {
+        self.current_model_id.as_ref()
     }
 
     fn open_db_conn(&self) -> rusqlite::Connection {

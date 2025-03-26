@@ -154,3 +154,17 @@ pub enum ChatResponse {
     // https://platform.openai.com/docs/api-reference/chat/streaming
     ChatResponseChunk(ChatResponseChunkData),
 }
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ModelsResponse {
+    pub object: String,
+    pub data: Vec<OpenAIModel>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OpenAIModel {
+    pub id: String,
+    pub object: String,
+    pub created: u32,
+    pub owned_by: String,
+}
