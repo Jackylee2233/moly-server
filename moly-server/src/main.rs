@@ -18,7 +18,7 @@ use backend_impls::{BackendImpl, LlamaEdgeApiServerBackend};
 use filesystem::{project_dirs, setup_model_downloads_folder};
 
 use moly_protocol::data::{DownloadedFile, Model, PendingDownload};
-use moly_protocol::open_ai::{ChatRequestData, ChatResponse};
+use moly_protocol::open_ai::{ChatRequestData, ChatResponse, ModelsResponse};
 use moly_protocol::protocol::{
     FileDownloadResponse, LoadModelRequest, LoadModelResponse, StartDownloadRequest,
 };
@@ -231,10 +231,32 @@ async fn chat_completions(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<ChatRequestData>,
 ) -> Result<Response, ApiErrorResponse> {
+    let mut state = state.backend.write().await;
+
+    // Check whether we need to load a new model.
+    let current_model_id = state.currently_loaded_model_id();
+    let mut should_load_model = false;
+    if let Some(model_id) = current_model_id {
+        if model_id != &request.model {
+            // Eject the current model first.
+            state.eject_model().await;
+            should_load_model = true;
+        }
+    } else {
+        should_load_model = true;
+    }
+
+    if should_load_model {
+        state
+            .load_model_with_default_opts(request.model.clone())
+            .await
+            .map_err(internal_error)?;
+    }
+
     let is_stream = request.stream.unwrap_or(false);
     let (tx, mut rx) = tokio::sync::mpsc::channel(32);
 
-    let result = state.backend.read().await.chat(request, tx);
+    let result = state.chat(request, tx);
     if let Err(e) = result {
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -287,6 +309,19 @@ async fn chat_completions(
     }
 }
 
+/// Lists the downloaded files in the OpenAI API api/v1/models format.
+async fn get_models(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ModelsResponse>, ApiErrorResponse> {
+    state
+        .backend
+        .read()
+        .await
+        .get_models()
+        .map(Json)
+        .map_err(internal_error)
+}
+
 #[tokio::main]
 async fn main() {
     env_logger::init();
@@ -299,6 +334,7 @@ async fn main() {
         .nest("/files", file_routes())
         .nest("/downloads", download_routes())
         .nest("/models", model_routes())
+        .nest("/api/v1", open_ai_api_routes())
         .layer(
             tower_http::trace::TraceLayer::new_for_http()
                 .on_request(|request: &Request<_>, _: &_| {
@@ -315,7 +351,9 @@ async fn main() {
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(8765);
 
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port))
+        .await
+        .unwrap();
     log::info!("🚀 server running on {}", listener.local_addr().unwrap());
     axum::serve(listener, app).await.unwrap();
 }
@@ -344,14 +382,17 @@ fn download_routes() -> Router<Arc<ApiState>> {
 /// Model management routes.
 fn model_routes() -> Router<Arc<ApiState>> {
     Router::new()
-        // TODO: We might want to provide an option to skip this /load step and do the loading automatically for the user,
-        // whenever the completions endpoint is used.
-        // We could have the API user porivde the model ID in the request instead of the current hardcoded "moly-chat" model.
-        // (This overall depends on how we want to handle the UI loading model animations, etc.)
+        // The `load` and `eject` operations are automatically handled by the chat completions endpoint.
+        // Keeping /load and /eject here for backwards compatibility.
         .route("/load", post(load_model))
         .route("/eject", post(eject_model))
         .route("/featured", get(get_featured_models))
         .route("/search", get(search_models))
-        .route("/v1/chat/completions", post(chat_completions))
-    // .route("/models_dir", post(update_models_dir)) // Not sure if we will support this, or how.
+        // .route("/models_dir", post(update_models_dir)) // Not sure if we will support this, or how.
+}
+
+fn open_ai_api_routes() -> Router<Arc<ApiState>> {
+    Router::new()
+        .route("/chat/completions", post(chat_completions))
+        .route("/models", get(get_models))
 }
